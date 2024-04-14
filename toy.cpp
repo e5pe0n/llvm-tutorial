@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -64,7 +65,7 @@ static int gettok() {
       LastChar = getchar();
     } while (isdigit(LastChar) || LastChar == '.');
 
-    NumVal = strtod(NumStr.c_str(), 0);
+    NumVal = strtod(NumStr.c_str(), nullptr);
     return tok_number;
   }
 
@@ -87,6 +88,8 @@ static int gettok() {
   return ThisChar;
 }
 
+namespace {
+
 class ExprAST {
  public:
   virtual ~ExprAST() = default;
@@ -106,6 +109,7 @@ class VariableExprAST : public ExprAST {
 
  public:
   VariableExprAST(const std::string &Name) : Name(Name) {}
+  Value *codegen() override;
 };
 
 class BinaryExprAST : public ExprAST {
@@ -116,6 +120,7 @@ class BinaryExprAST : public ExprAST {
   BinaryExprAST(char Op, std::unique_ptr<ExprAST> LHS,
                 std::unique_ptr<ExprAST> RHS)
       : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+  Value *codegen() override;
 };
 
 class CallExprAST : public ExprAST {
@@ -126,6 +131,7 @@ class CallExprAST : public ExprAST {
   CallExprAST(const std::string &Callee,
               std::vector<std::unique_ptr<ExprAST>> Args)
       : Callee(Callee), Args(std::move(Args)) {}
+  Value *codegen() override;
 };
 
 class PrototypeAST {
@@ -136,6 +142,7 @@ class PrototypeAST {
   PrototypeAST(const std::string &Name, std::vector<std::string> Args)
       : Name(Name), Args(std::move(Args)) {}
 
+  Function *codegen();
   const std::string &getName() const { return Name; }
 };
 
@@ -147,10 +154,26 @@ class FunctionAST {
   FunctionAST(std::unique_ptr<PrototypeAST> Proto,
               std::unique_ptr<ExprAST> Body)
       : Proto(std::move(Proto)), Body(std::move(Body)) {}
+  Function *codegen();
 };
 
+}  // namespace
 static int CurTok;
 static int getNextToken() { return CurTok = gettok(); }
+
+static std::map<char, int> BinopPrecedence;
+
+static int GetTokPrecedence() {
+  if (!isascii(CurTok)) {
+    return -1;
+  }
+
+  int TokPrec = BinopPrecedence[CurTok];
+  if (TokPrec <= 0) {
+    return -1;
+  }
+  return TokPrec;
+}
 
 std::unique_ptr<ExprAST> LogError(const char *Str) {
   fprintf(stderr, "Error: %s\n", Str);
@@ -208,7 +231,7 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
         break;
       }
 
-      if (CurTok != '.') {
+      if (CurTok != ',') {
         return LogError("Expected ')' or ',' in argument list");
       }
 
@@ -233,20 +256,6 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
   }
 }
 
-static std::map<char, int> BinopPrecedence;
-
-static int GetTokPrecedence() {
-  if (!isascii(CurTok)) {
-    return -1;
-  }
-
-  int TokPrec = BinopPrecedence[CurTok];
-  if (TokPrec <= 0) {
-    return -1;
-  }
-  return TokPrec;
-}
-
 static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
                                               std::unique_ptr<ExprAST> LHS) {
   while (true) {
@@ -267,9 +276,13 @@ static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
     int NextPrec = GetTokPrecedence();
     if (TokPrec < NextPrec) {
       RHS = ParseBinOpRHS(TokPrec + 1, std::move(RHS));
-      LHS = std::make_unique<BinaryExprAST>(BinOp, std::move(LHS),
-                                            std::move(RHS));
+      if (!RHS) {
+        return nullptr;
+      }
     }
+
+    LHS =
+        std::make_unique<BinaryExprAST>(BinOp, std::move(LHS), std::move(RHS));
   }
 }
 
@@ -323,7 +336,8 @@ static std::unique_ptr<FunctionAST> ParseDefinition() {
 
 static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
   if (auto E = ParseExpression()) {
-    auto Proto = std::make_unique<PrototypeAST>("", std::vector<std::string>());
+    auto Proto = std::make_unique<PrototypeAST>("__anon_expr",
+                                                std::vector<std::string>());
     return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
   }
 
@@ -335,25 +349,157 @@ static std::unique_ptr<PrototypeAST> ParseExtern() {
   return ParsePrototype();
 }
 
+static std::unique_ptr<LLVMContext> TheContext;
+static std::unique_ptr<IRBuilder<>> Builder;
+static std::unique_ptr<Module> TheModule;
+static std::map<std::string, Value *> NamedValues;
+
+Value *LogErrorV(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+Value *NumberExprAST::codegen() {
+  return ConstantFP::get(*TheContext, APFloat(Val));
+}
+
+Value *VariableExprAST::codegen() {
+  Value *V = NamedValues[Name];
+  if (!V) {
+    return LogErrorV("Unknown variable name");
+  }
+  return V;
+}
+
+Value *BinaryExprAST::codegen() {
+  Value *L = LHS->codegen();
+  Value *R = RHS->codegen();
+  if (!L || !R) {
+    return nullptr;
+  }
+
+  switch (Op) {
+    case '+':
+      return Builder->CreateFAdd(L, R, "addtmp");
+    case '-':
+      return Builder->CreateFSub(L, R, "subtmp");
+    case '*':
+      return Builder->CreateFMul(L, R, "multmp");
+    case '<':
+      L = Builder->CreateFCmpULT(L, R, "cmptmp");
+      // Convert bool 0/1 to double 0.0 or 1.0
+      return Builder->CreateUIToFP(L, Type::getDoubleTy(*TheContext),
+                                   "booltmp");
+    default:
+      return LogErrorV("invalid binary operator");
+  }
+}
+
+Value *CallExprAST::codegen() {
+  Function *CalleeF = TheModule->getFunction(Callee);
+  if (!CalleeF) {
+    return LogErrorV("Unknown function referenced");
+  }
+
+  if (CalleeF->arg_size() != Args.size()) {
+    return LogErrorV("Incorrect arguments passed");
+  }
+
+  std::vector<Value *> ArgsV;
+  for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+    ArgsV.push_back(Args[i]->codegen());
+    if (!ArgsV.back()) {
+      return nullptr;
+    }
+  }
+
+  return Builder->CreateCall(CalleeF, ArgsV, "calltmp");
+}
+
+Function *PrototypeAST::codegen() {
+  std::vector<Type *> Doubles(Args.size(), Type::getDoubleTy(*TheContext));
+
+  FunctionType *FT =
+      FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false);
+  Function *F =
+      Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
+
+  unsigned Idx = 0;
+  for (auto &Arg : F->args()) {
+    Arg.setName(Args[Idx++]);
+  }
+
+  return F;
+}
+
+Function *FunctionAST::codegen() {
+  Function *TheFunction = TheModule->getFunction(Proto->getName());
+
+  if (!TheFunction) {
+    TheFunction = Proto->codegen();
+  }
+
+  if (!TheFunction) {
+    return nullptr;
+  }
+
+  BasicBlock *BB = BasicBlock::Create(*TheContext, "entry", TheFunction);
+  Builder->SetInsertPoint(BB);
+
+  NamedValues.clear();
+  for (auto &Arg : TheFunction->args()) {
+    NamedValues[std::string(Arg.getName())] = &Arg;
+  }
+
+  if (Value *RetVal = Body->codegen()) {
+    Builder->CreateRet(RetVal);
+    verifyFunction(*TheFunction);
+    return TheFunction;
+  }
+
+  TheFunction->eraseFromParent();
+  return nullptr;
+}
+
+static void InitializeModule() {
+  TheContext = std::make_unique<LLVMContext>();
+  TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+
+  Builder = std::make_unique<IRBuilder<>>(*TheContext);
+}
+
 static void HandleDefinition() {
-  if (ParseDefinition()) {
-    fprintf(stderr, "Parsed a function definitino.\n");
+  if (auto FnAST = ParseDefinition()) {
+    if (auto *FnIR = FnAST->codegen()) {
+      fprintf(stderr, "Read a function definition.\n");
+      FnIR->print(errs());
+      fprintf(stderr, "\n");
+    }
   } else {
     getNextToken();
   }
 }
 
 static void HandleExtern() {
-  if (ParseExtern()) {
-    fprintf(stderr, "Parsed an extern\n");
+  if (auto ProtoAST = ParseExtern()) {
+    if (auto *FnIR = ProtoAST->codegen()) {
+      fprintf(stderr, "Read an extern\n");
+      FnIR->print(errs());
+      fprintf(stderr, "\n");
+    }
   } else {
     getNextToken();
   }
 }
 
 static void HandleTopLevelExpression() {
-  if (ParseTopLevelExpr()) {
-    fprintf(stderr, "Parsed a top-level expr\n");
+  if (auto FnAST = ParseTopLevelExpr()) {
+    if (auto *FnIR = FnAST->codegen()) {
+      fprintf(stderr, "Read a top-level expr\n");
+      FnIR->print(errs());
+      fprintf(stderr, "\n");
+      FnIR->eraseFromParent();
+    }
   } else {
     getNextToken();
   }
@@ -370,8 +516,10 @@ static void MainLoop() {
         break;
       case tok_def:
         HandleDefinition();
+        break;
       case tok_extern:
         HandleExtern();
+        break;
       default:
         HandleTopLevelExpression();
         break;
@@ -382,13 +530,17 @@ static void MainLoop() {
 int main() {
   BinopPrecedence['<'] = 10;
   BinopPrecedence['+'] = 20;
-  BinopPrecedence['-'] = 30;
+  BinopPrecedence['-'] = 20;
   BinopPrecedence['*'] = 40;
 
   fprintf(stderr, "ready> ");
   getNextToken();
 
+  InitializeModule();
+
   MainLoop();
+
+  TheModule->print(errs(), nullptr);
 
   return 0;
 }
