@@ -4,8 +4,8 @@
       "name": "Linux",
       "includePath": [
         "${workspaceFolder}/**",
-        "/usr/include/llvm-14",
-        "/usr/include/llvm-c-14"
+        "/usr/include/llvm-18",
+        "/usr/include/llvm-c-18"
       ],
       "compilerPath": "/usr/bin/clang",
       "cStandard": "c17",
